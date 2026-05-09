@@ -20,12 +20,11 @@ Usage:
 """
 
 import argparse
-import math
 
+import dynamiqs as dq
 import jax
 import jax.numpy as jnp
 import numpy as np
-import dynamiqs as dq
 from cmaes import SepCMA
 from matplotlib import pyplot as plt
 
@@ -33,21 +32,22 @@ from matplotlib import pyplot as plt
 jax.config.update("jax_enable_x64", True)
 
 # ── Fixed system parameters ───────────────────────────────────────────────────
-NA      = 15    # storage Hilbert-space dimension
-NB      = 5     # buffer Hilbert-space dimension
+NA = 15  # storage Hilbert-space dimension
+NB = 5  # buffer Hilbert-space dimension
 KAPPA_B = 10.0  # buffer decay rate       [MHz]
-KAPPA_A = 1.0   # storage single-ph. loss [MHz]
+KAPPA_A = 1.0  # storage single-ph. loss [MHz]
 
 # Fast-proxy measurement windows
-TZ_SHORT = 10.0   # µs — stays in the linear regime for T_z ≥ 100 µs
-TZ_PTS   = 5      # points in [0, TZ_SHORT] for linear regression
-TX_T1    = 0.30   # µs — first parity sample for T_x
-TX_T2    = 1.00   # µs — second parity sample for T_x
+TZ_SHORT = 10.0  # µs — stays in the linear regime for T_z ≥ 100 µs
+TZ_PTS = 5  # points in [0, TZ_SHORT] for linear regression
+TX_T1 = 0.30  # µs — first parity sample for T_x
+TX_T2 = 1.00  # µs — second parity sample for T_x
 
 _OPTS = dq.Options(progress_meter=False)
 
 
 # ── JAX-native linear fit helpers ─────────────────────────────────────────────
+
 
 def _linfit_slope(t, y):
     """Slope of y vs t via closed-form OLS. Both are 1-D JAX arrays."""
@@ -57,6 +57,7 @@ def _linfit_slope(t, y):
 
 
 # ── Loss function factory ─────────────────────────────────────────────────────
+
 
 def make_loss_fn(target_nu: float, lam: float):
     """
@@ -69,8 +70,8 @@ def make_loss_fn(target_nu: float, lam: float):
     a = dq.tensor(dq.destroy(NA), dq.eye(NB))
     b = dq.tensor(dq.eye(NA), dq.destroy(NB))
 
-    n_op  = a.dag() @ a                        # photon-number (storage)
-    sx_op = (1j * jnp.pi * n_op).expm()        # parity  (−1)^n
+    n_op = a.dag() @ a  # photon-number (storage)
+    sx_op = (1j * jnp.pi * n_op).expm()  # parity  (−1)^n
 
     loss_b = jnp.sqrt(KAPPA_B) * b
     loss_a = jnp.sqrt(KAPPA_A) * a
@@ -81,12 +82,12 @@ def make_loss_fn(target_nu: float, lam: float):
 
     def loss_fn(x):
         """x = [Re(g2), Im(g2), Re(eps_d), Im(eps_d)]"""
-        g2    = x[0] + 1j * x[1]
+        g2 = x[0] + 1j * x[1]
         eps_d = x[2] + 1j * x[3]
 
         # ── Cat-size estimate from adiabatic elimination ──────────────────────
-        eps_2    = 2.0 * g2 * eps_d / KAPPA_B
-        kappa_2  = 4.0 * jnp.abs(g2) ** 2 / KAPPA_B
+        eps_2 = 2.0 * g2 * eps_d / KAPPA_B
+        kappa_2 = 4.0 * jnp.abs(g2) ** 2 / KAPPA_B
         alpha_sq = 2.0 * (eps_2 - KAPPA_A / 4.0) / kappa_2
         # Phase-preserving square root so blobs stay on the cat manifold
         alpha_est = jnp.sqrt(jnp.abs(alpha_sq)) * jnp.exp(
@@ -114,9 +115,9 @@ def make_loss_fn(target_nu: float, lam: float):
         res_z = dq.mesolve(
             H, [loss_b, loss_a], psi_z, ts_z, exp_ops=[sz_op], options=_OPTS
         )
-        szt   = res_z.expects[0].real          # shape (TZ_PTS,)
+        szt = res_z.expects[0].real  # shape (TZ_PTS,)
         slope = _linfit_slope(ts_z, szt - 1.0)
-        Tz    = jnp.clip(-1.0 / jnp.clip(slope, -1.0, -1e-9), 1.0, 1e9)
+        Tz = jnp.clip(-1.0 / jnp.clip(slope, -1.0, -1e-9), 1.0, 1e9)
 
         # ── T_x: two-point parity ratio ───────────────────────────────────────
         # P(t) = exp(−t/T_x)  →  T_x = (t2−t1) / log(P(t1)/P(t2))
@@ -126,9 +127,10 @@ def make_loss_fn(target_nu: float, lam: float):
         )
         px1 = jnp.clip(res_x.expects[0, 0].real, 1e-9, 1.0)
         px2 = jnp.clip(res_x.expects[0, 1].real, 1e-9, 1.0)
-        Tx  = jnp.clip(
+        Tx = jnp.clip(
             (TX_T2 - TX_T1) / jnp.log(jnp.clip(px1 / px2, 1.0001, 1e9)),
-            1e-3, 1e9,
+            1e-3,
+            1e9,
         )
 
         # ── Loss: maximize T_z (primary) and T_x (secondary) ─────────────────
@@ -136,7 +138,7 @@ def make_loss_fn(target_nu: float, lam: float):
         # High target_nu (≥1000) forces the optimizer into the large-|α|² regime
         # where T_z grows exponentially while T_x decreases only algebraically.
         ratio = Tz / Tx
-        loss  = -jnp.log(Tz) - jnp.log(Tx) + lam * jnp.abs(target_nu - ratio)
+        loss = -jnp.log(Tz) - jnp.log(Tx) + lam * jnp.abs(target_nu - ratio)
         return loss, Tx, Tz
 
     return loss_fn
@@ -144,51 +146,49 @@ def make_loss_fn(target_nu: float, lam: float):
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
+
 def main():
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    parser.add_argument("--epochs", type=int,   default=60,    help="CMA-ES epochs")
-    parser.add_argument("--batch",  type=int,   default=12,    help="Population size")
-    parser.add_argument("--nu",     type=float, default=1000.0,
-                        help="Target bias T_z/T_x (large → push into high-|α|² regime)")
-    parser.add_argument("--lam",    type=float, default=0.5,
-                        help="Bias penalty weight (lower = maximise lifetimes harder)")
+    parser.add_argument("--epochs", type=int, default=60, help="CMA-ES epochs")
+    parser.add_argument("--batch", type=int, default=12, help="Population size")
+    parser.add_argument(
+        "--nu",
+        type=float,
+        default=1000.0,
+        help="Target bias T_z/T_x (large → push into high-|α|² regime)",
+    )
+    parser.add_argument(
+        "--lam",
+        type=float,
+        default=0.5,
+        help="Bias penalty weight (lower = maximise lifetimes harder)",
+    )
     parser.add_argument("--no-plot", action="store_true", help="Skip plots")
     args = parser.parse_args()
 
     # ── Device selection ──────────────────────────────────────────────────────
-    gpus = [d for d in jax.devices() if d.platform == "gpu"]
-    n_devices = len(gpus) if gpus else 1
-    if gpus:
-        print(f"Found {n_devices} GPU(s): {gpus}")
+    gpu = [d for d in jax.devices() if d.platform == "gpu"]
+    if len(gpu) > 1:
+        jax.config.update("jax_default_device", gpu[1])
+        print(f"Running on GPU: {gpu[1]}  (gpu[0] reserved)")
+    elif len(gpu) == 1:
+        jax.config.update("jax_default_device", gpu[0])
+        print(f"Running on GPU: {gpu[0]}")
     else:
-        print("No GPU detected — running on CPU")
-
-    # Batch must be divisible by n_devices so pmap can shard evenly.
-    # Round up and let CMA-ES use the adjusted population size.
-    per_device  = math.ceil(args.batch / n_devices)
-    actual_batch = per_device * n_devices
-    if actual_batch != args.batch:
-        print(f"Rounding batch {args.batch} → {actual_batch} (evenly across {n_devices} device(s))")
+        print(
+            "No GPU detected — running on CPU (set JAX_PLATFORM_NAME=gpu if available)"
+        )
 
     # ── Build batched loss ────────────────────────────────────────────────────
     loss_fn = make_loss_fn(args.nu, args.lam)
-
-    if n_devices > 1:
-        # pmap shards axis-0 (devices) across GPUs; vmap vectorises axis-1 within each GPU.
-        # Call signature: batched_loss(xs)  with xs.shape == (n_devices, per_device, 4)
-        batched_loss = jax.pmap(jax.vmap(loss_fn))
-        multi_gpu = True
-    else:
-        # Single device: plain jit+vmap, xs.shape == (actual_batch, 4)
-        batched_loss = jax.jit(jax.vmap(loss_fn))
-        multi_gpu = False
+    # vmap over first axis (population), jit the whole batch in one call
+    batched_loss = jax.jit(jax.vmap(loss_fn))
 
     # Warm-up compile pass (avoids counting JIT time in epoch 0)
     print("Compiling (one-time JIT warm-up) …")
-    warm_xs = jnp.ones((n_devices, per_device, 4) if multi_gpu else (actual_batch, 4))
-    _warm = batched_loss(warm_xs)
+    _warm = batched_loss(jnp.ones((args.batch, 4)))
     _warm[0].block_until_ready()
     print("Done.\n")
 
@@ -198,42 +198,43 @@ def main():
     optimizer = SepCMA(
         mean=np.array([1.0, 0.0, 4.0, 0.0]),
         sigma=0.4,
-        bounds=np.array([
-            [0.5,  6.0],   # Re(g2)   — minimum ~1.58 ensures κ_2 ≥ κ_a
-            [-1.5, 1.5],   # Im(g2)
-            [0.5, 15.0],   # Re(eps_d) — larger → bigger cat
-            [-2.0, 2.0],   # Im(eps_d)
-        ]),
-        population_size=actual_batch,
+        bounds=np.array(
+            [
+                [0.5, 20.0],  # Re(g2)   — minimum ~1.58 ensures κ_2 ≥ κ_a
+                [-5.5, 5.5],  # Im(g2)
+                [0.5, 25.0],  # Re(eps_d) — larger → bigger cat
+                [-5.0, 5.0],  # Im(eps_d)
+            ]
+        ),
+        population_size=args.batch,
         seed=42,
     )
 
-    mean_history  = []
-    loss_history  = []
-    Tx_history    = []
-    Tz_history    = []
+    mean_history = []
+    loss_history = []
+    Tx_history = []
+    Tz_history = []
     ratio_history = []
 
     print(
-        f"CMA-ES  |  epochs={args.epochs}  batch={actual_batch}"
-        f"  devices={n_devices}  ν_target={args.nu}  λ={args.lam}"
+        f"CMA-ES  |  epochs={args.epochs}  batch={args.batch}"
+        f"  ν_target={args.nu}  λ={args.lam}"
     )
-    print(f"{'Epoch':>5}  {'loss':>9}  {'T_x (µs)':>10}  {'T_z (µs)':>10}  {'bias':>10}")
+    print(
+        f"{'Epoch':>5}  {'loss':>9}  {'T_x (µs)':>10}  {'T_z (µs)':>10}  {'bias':>10}"
+    )
     print("─" * 55)
 
     for epoch in range(args.epochs):
-        # Sample population — shape (actual_batch, 4)
+        # Sample population and evaluate entire batch in one GPU call
         xs = jnp.array([optimizer.ask() for _ in range(optimizer.population_size)])
+        losses, Txs, Tzs = batched_loss(xs)
 
-        # Reshape for pmap: (n_devices, per_device, 4); no-op for single device
-        xs_in = xs.reshape(n_devices, per_device, 4) if multi_gpu else xs
-        losses_out, Txs_out, Tzs_out = batched_loss(xs_in)
-
-        # Flatten device axis back to (actual_batch,)
-        losses_np = np.array(losses_out).reshape(-1)
-        Txs_np    = np.array(Txs_out).reshape(-1)
-        Tzs_np    = np.array(Tzs_out).reshape(-1)
-        xs_np     = np.array(xs)
+        # Convert to numpy for CMA-ES (host-side)
+        losses_np = np.array(losses)
+        Txs_np = np.array(Txs)
+        Tzs_np = np.array(Tzs)
+        xs_np = np.array(xs)
 
         optimizer.tell([(xs_np[i], losses_np[i]) for i in range(len(xs_np))])
 
@@ -265,7 +266,7 @@ def main():
 
     # ── Plots ─────────────────────────────────────────────────────────────────
     mean_history = np.array(mean_history)
-    epochs_arr   = np.arange(args.epochs)
+    epochs_arr = np.arange(args.epochs)
 
     fig, axes = plt.subplots(2, 2, figsize=(12, 8))
 
@@ -280,8 +281,9 @@ def main():
     axes[0, 1].grid(True, alpha=0.3)
 
     axes[1, 0].semilogy(epochs_arr, ratio_history, label="actual $T_Z / T_X$")
-    axes[1, 0].axhline(args.nu, linestyle="--", color="r",
-                       label=f"target ν = {args.nu}")
+    axes[1, 0].axhline(
+        args.nu, linestyle="--", color="r", label=f"target ν = {args.nu}"
+    )
     axes[1, 0].set(xlabel="Epoch", ylabel="Bias  $T_Z / T_X$", title="Bias vs Epoch")
     axes[1, 0].legend()
     axes[1, 0].grid(True, alpha=0.3)
@@ -296,7 +298,7 @@ def main():
 
     plt.suptitle(
         f"CMA-ES Cat Qubit  (ν_target={args.nu}, λ={args.lam})"
-        f"  →  T_z={float(Tz_f):.0f} µs, bias={float(Tz_f)/float(Tx_f):.0f}"
+        f"  →  T_z={float(Tz_f):.0f} µs, bias={float(Tz_f) / float(Tx_f):.0f}"
     )
     plt.tight_layout()
     plt.savefig("cat_cmaes_results.png", dpi=150)
