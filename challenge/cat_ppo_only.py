@@ -150,13 +150,30 @@ def run_online_ppo(loss_fn, x0, drift_traj,
                    optimizer_freq=3, horizon=64, n_ppo_epochs=4,
                    clip_eps=0.2, gamma=0.99, gae_lambda=0.95,
                    entropy_coef=0.01, action_scale=0.25,
-                   hidden_size=64, seed=7):
+                   hidden_size=64, seed=7,
+                   nu=1000.0, lam=0.5):
     """
     Online PPO with JAX-JIT compiled actor+critic gradient.
 
-    State (7-D): normalized x_nominal (4), log Tz (1), log Tx (1), reward EMA (1).
-    Action (4-D): Δx ~ N(action_scale·tanh(mu), exp(log_std)²).
-    Drift is NOT given to the policy; it learns to compensate from reward alone.
+    Bugs fixed vs original:
+      1. Log-std tightened from (-4,-0.5) to (-3,-2): max std 0.61→0.14.
+         The original allowed noise ≫ action_scale, swamping the tanh-bounded
+         mean and creating massive distribution mismatch in the PPO ratio.
+      2. Bias penalty capped at 20 in the reward: the uncapped |Tz/Tx - ν|
+         term (potentially thousands) completely drowned log(Tz) during
+         exploration, causing the policy to optimize ratio satisfaction
+         at the expense of Tz — manifesting as "maximize Tx."
+      3. State trend signals replace the slow reward EMA: delta_log_Tz and
+         delta_log_Tx give the policy direct per-step feedback on whether
+         Tz/Tx are improving, enabling drift-direction inference without
+         observing drift directly.
+
+    State (8-D): normalized x_nominal (4), log Tz (1), log Tx (1),
+                 Δlog Tz (1), Δlog Tx (1).
+    Action (4-D): Δx sampled from N(action_scale·tanh(μ), exp(log_std)²)
+                  with log_std ∈ [-3, -2] → std ∈ [0.05, 0.14].
+    Reward: log(Tz) + log(Tx) - lam·clip(|Tz/Tx - ν|, 0, 20)
+            — penalty capped so log(Tz) always contributes meaningfully.
     """
     _EVAL = jax.jit(loss_fn)
 
@@ -165,17 +182,21 @@ def run_online_ppo(loss_fn, x0, drift_traj,
     xs = jnp.array((BOUNDS[:, 1] - BOUNDS[:, 0]) / 2.0)
     TZ_MU, TZ_SC = float(jnp.log(jnp.array(50.0))), 3.0
     TX_MU, TX_SC = float(jnp.log(jnp.array(0.5))),  2.0
-    RW_SC        = 5.0
 
-    def make_state(x_nom, Tz, Tx, ema_r):
+    def make_state(x_nom, Tz, Tx, Tz_prev, Tx_prev):
+        log_Tz      = jnp.log(jnp.clip(jnp.array(Tz),      1e-3, 1e9))
+        log_Tx      = jnp.log(jnp.clip(jnp.array(Tx),      1e-9, 1e3))
+        log_Tz_prev = jnp.log(jnp.clip(jnp.array(Tz_prev), 1e-3, 1e9))
+        log_Tx_prev = jnp.log(jnp.clip(jnp.array(Tx_prev), 1e-9, 1e3))
         return jnp.concatenate([
             (x_nom - xc) / xs,
-            jnp.array([(jnp.log(jnp.clip(jnp.array(Tz), 1e-3, 1e9)) - TZ_MU) / TZ_SC,
-                        (jnp.log(jnp.clip(jnp.array(Tx), 1e-9, 1e3)) - TX_MU) / TX_SC,
-                        ema_r / RW_SC]),
+            jnp.array([(log_Tz - TZ_MU) / TZ_SC,
+                        (log_Tx - TX_MU) / TX_SC,
+                        log_Tz - log_Tz_prev,   # positive → Tz improved this step
+                        log_Tx - log_Tx_prev]),  # positive → Tx improved this step
         ])
 
-    SD, AD = 7, 4
+    SD, AD = 8, 4   # 8-D state: x(4) + logTz + logTx + ΔlogTz + ΔlogTx
 
     # Networks
     rng = jax.random.PRNGKey(seed)
@@ -188,10 +209,11 @@ def run_online_ppo(loss_fn, x0, drift_traj,
     cm, cv = zc, zc
 
     # JIT-compiled combined PPO loss
+    # Fix 1: log_std clamped to (-3, -2) matching rollout → no distribution mismatch
     def _loss(ap_, cp_, states, actions, old_lp, advs, rets):
         out  = jax.vmap(lambda s: _mlp(ap_, s))(states)
         mu   = action_scale * jnp.tanh(out[:, :AD])
-        lst  = jnp.clip(out[:, AD:], -4.0, -0.5)
+        lst  = jnp.clip(out[:, AD:], -3.0, -2.0)            # Fix 1: tight std
         std  = jnp.exp(lst)
         nlp  = -0.5 * jnp.sum(((actions - mu) / std)**2 + 2*lst + jnp.log(2*jnp.pi), axis=-1)
         r    = jnp.exp(jnp.clip(nlp - old_lp, -5.0, 5.0))
@@ -203,7 +225,7 @@ def run_online_ppo(loss_fn, x0, drift_traj,
 
     ppo_grad = jax.jit(jax.value_and_grad(_loss, argnums=(0, 1)))
 
-    # Warm-up compile
+    # Warm-up compile with correct (horizon, SD=8) shape
     _z = lambda sh: jnp.zeros(sh)
     ppo_grad(ap, cp, _z((horizon, SD)), _z((horizon, AD)),
              _z(horizon), _z(horizon), _z(horizon))
@@ -215,38 +237,44 @@ def run_online_ppo(loss_fn, x0, drift_traj,
 
     x = jnp.array(x0, dtype=jnp.float64)
     _, Tx_now, Tz_now = _EVAL(x)
-    ema_r = 0.0
+    Tz_prev, Tx_prev = float(Tz_now), float(Tx_now)   # Fix 3: track prev for delta
     param_h, Tx_h, Tz_h = [], [], []
 
     for drift_np in drift_traj:
         d = jnp.array(drift_np)
 
         for _ in range(optimizer_freq):
-            s = make_state(x, float(Tz_now), float(Tx_now), ema_r)
+            s = make_state(x, float(Tz_now), float(Tx_now), Tz_prev, Tx_prev)
 
             out    = _mlp(ap, s)
             mu     = action_scale * jnp.tanh(out[:AD])
-            lst    = jnp.clip(out[AD:], -4.0, -0.5)
+            lst    = jnp.clip(out[AD:], -3.0, -2.0)         # Fix 1: tight std (max 0.14)
             rng, k = jax.random.split(rng)
             noise  = jax.random.normal(k, (AD,))
             action = mu + jnp.exp(lst) * noise
             lp     = float(-0.5 * jnp.sum(noise**2 + 2*lst + jnp.log(2*jnp.pi)))
 
             x_new = jnp.clip(x + action, BOUNDS_LO, BOUNDS_HI)
-            lv, Tx_now, Tz_now = _EVAL(jnp.clip(x_new + d, BOUNDS_LO, BOUNDS_HI))
-            reward = float(-lv)
-            ema_r  = 0.9 * ema_r + 0.1 * reward
+            _, Tx_now, Tz_now = _EVAL(jnp.clip(x_new + d, BOUNDS_LO, BOUNDS_HI))
+
+            # Fix 2: cap ratio penalty so log(Tz) always contributes to reward
+            ratio_err = float(jnp.clip(
+                jnp.abs(Tz_now / jnp.clip(Tx_now, 1e-9, None) - nu), 0.0, 20.0))
+            reward = (float(jnp.log(jnp.clip(Tz_now, 1e-3, None)))
+                      + float(jnp.log(jnp.clip(Tx_now, 1e-9, None)))
+                      - lam * ratio_err)
 
             bs[idx] = np.array(s)
             ba[idx] = np.array(action)
             blp[idx] = lp
             br[idx] = reward
             bv[idx] = float(_mlp(cp, s)[0])
+            Tz_prev, Tx_prev = float(Tz_now), float(Tx_now)  # Fix 3: update delta ref
             idx += 1
             x = x_new
 
             if idx == horizon:
-                s_next     = make_state(x, float(Tz_now), float(Tx_now), ema_r)
+                s_next     = make_state(x, float(Tz_now), float(Tx_now), Tz_prev, Tx_prev)
                 nv         = float(_mlp(cp, s_next)[0])
                 advs, rets = _gae(br, bv, nv, gamma, gae_lambda)
                 sj, aj, lpj = jnp.array(bs), jnp.array(ba), jnp.array(blp)
@@ -338,6 +366,7 @@ def main():
         optimizer_freq=args.opt_freq,
         horizon=args.horizon,
         n_ppo_epochs=args.ppo_epochs,
+        nu=args.nu, lam=args.lam,
     )
     print(f"   Tz mean={Tz_ppo.mean():.1f}, min={Tz_ppo.min():.1f} µs")
 

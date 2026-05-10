@@ -491,42 +491,40 @@ def run_online_ppo(
     hidden_size: int = 64,
     seed: int = 7,
     batched_loss=None,
+    nu: float = 1000.0,
+    lam: float = 0.5,
 ) -> tuple:
     """
     Online PPO optimizer for cat-qubit parameter stabilization.
 
-    The actor MLP observes a 7-D state and outputs bounded parameter
-    adjustments Δx.  Evaluation occurs at x_actual = x_nominal + drift;
-    the drift vector is NOT given to the policy — it must learn to
-    compensate purely through the reward signal.
+    Three bugs fixed vs the original 7-D / uncapped implementation:
 
-    State (7-D)
+    Fix 1 — log_std tightened (-4,-0.5) → (-3,-2): max std 0.61 → 0.14.
+      The old range let noise swamp the tanh-bounded mean, producing actions
+      far outside the intended ±action_scale range and creating a distribution
+      mismatch in the PPO importance ratio that the clip couldn't correct.
+
+    Fix 2 — bias penalty capped at 20 in the reward.
+      Uncapped |Tz/Tx − ν| during exploration can be thousands, completely
+      drowning log(Tz) (≲ 10).  The policy optimised ratio satisfaction at
+      any cost, including shrinking α so Tx grew while Tz collapsed.
+
+    Fix 3 — state trend signals replace slow reward EMA.
+      Δlog Tz and Δlog Tx give the policy direct per-step feedback on whether
+      lifetimes are improving, enabling drift-direction inference without
+      observing the drift vector directly.
+
+    State (8-D)
     -----------
-    • Normalized nominal params  x̂  (4-D): (x − bounds_midpoint) / half_range
+    • Normalized nominal params  x̂  (4-D)
     • log T_z  normalized              (1-D)
     • log T_x  normalized              (1-D)
-    • EMA of recent reward             (1-D)
+    • Δ log T_z  (current − previous)  (1-D)   ← Fix 3
+    • Δ log T_x  (current − previous)  (1-D)   ← Fix 3
 
-    Action (4-D)
-    ------------
-    Δx ~ N(μ, σ²).  μ = action_scale × tanh(actor_out[:4]) bounds the mean
-    to ±action_scale.  log_std clamped to [−4, −0.5] → σ ∈ [0.018, 0.61].
-
-    Training
-    --------
-    PPO rollout of length `horizon`, then `n_ppo_epochs` gradient updates
-    using the clipped surrogate + 0.5 × value loss − entropy_coef × H(π).
-    JIT-compiled joint actor+critic gradient via jax.value_and_grad.
-    Adam (b₁=0.9, b₂=0.999) for both actor and critic.
-
-    Proposed improvements
-    ---------------------
-    • Augment state with a Kalman-filtered drift estimate from reward history
-      to give the policy predictive capability (cf. predictive Adam/CMA-ES).
-    • Replace MLP with an LSTM: recurrent memory lets the policy learn the
-      sinusoidal drift period and pre-compensate phase changes.
-    • Off-policy reuse: importance-weighted PPO over a replay buffer to
-      extract more signal per expensive dq.mesolve call.
+    Reward
+    ------
+    log(Tz) + log(Tx) − lam × clip(|Tz/Tx − ν|, 0, 20)   ← Fix 2
     """
     _EVAL = jax.jit(loss_fn)
 
@@ -537,18 +535,23 @@ def run_online_ppo(
     _TZ_LOG_SCALE = 3.0
     _TX_LOG_MU    = float(jnp.log(jnp.array(0.5)))
     _TX_LOG_SCALE = 2.0
-    _REW_SCALE    = 5.0
 
-    def make_state(x_nom, Tz, Tx, ema_rew):
-        x_n  = (x_nom - _x_c) / _x_s
-        tz_n = (jnp.log(jnp.clip(jnp.array(Tz), 1e-3, 1e9)) - _TZ_LOG_MU)  / _TZ_LOG_SCALE
-        tx_n = (jnp.log(jnp.clip(jnp.array(Tx), 1e-9, 1e3)) - _TX_LOG_MU)  / _TX_LOG_SCALE
-        r_n  = ema_rew / _REW_SCALE
-        return jnp.concatenate([x_n, jnp.array([tz_n, tx_n, r_n])])
+    def make_state(x_nom, Tz, Tx, Tz_prev, Tx_prev):
+        log_Tz      = jnp.log(jnp.clip(jnp.array(Tz),      1e-3, 1e9))
+        log_Tx      = jnp.log(jnp.clip(jnp.array(Tx),      1e-9, 1e3))
+        log_Tz_prev = jnp.log(jnp.clip(jnp.array(Tz_prev), 1e-3, 1e9))
+        log_Tx_prev = jnp.log(jnp.clip(jnp.array(Tx_prev), 1e-9, 1e3))
+        x_n = (x_nom - _x_c) / _x_s
+        return jnp.concatenate([x_n, jnp.array([
+            (log_Tz - _TZ_LOG_MU) / _TZ_LOG_SCALE,
+            (log_Tx - _TX_LOG_MU) / _TX_LOG_SCALE,
+            log_Tz - log_Tz_prev,    # positive → Tz improved this step
+            log_Tx - log_Tx_prev,    # positive → Tx improved this step
+        ])])
 
-    STATE_DIM  = 7
+    STATE_DIM  = 8   # x(4) + logTz + logTx + ΔlogTz + ΔlogTx
     ACTION_DIM = 4
-    ACTOR_OUT  = ACTION_DIM * 2   # 4 means + 4 log_stds
+    ACTOR_OUT  = ACTION_DIM * 2
 
     # ── Network and Adam-state initialisation ────────────────────────────────
     rng = jax.random.PRNGKey(seed)
@@ -563,10 +566,9 @@ def run_online_ppo(
 
     # ── JIT-compiled combined PPO loss + gradient ────────────────────────────
     def _ppo_loss(ap_, cp_, states, actions, old_lp, advs, rets):
-        # Actor ── clipped surrogate + entropy bonus
-        out  = jax.vmap(lambda s: _ppo_mlp(ap_, s))(states)          # (B, ACTOR_OUT)
-        mu   = action_scale * jnp.tanh(out[:, :ACTION_DIM])          # bounded mean
-        lst  = jnp.clip(out[:, ACTION_DIM:], -4.0, -0.5)             # log std
+        out  = jax.vmap(lambda s: _ppo_mlp(ap_, s))(states)
+        mu   = action_scale * jnp.tanh(out[:, :ACTION_DIM])
+        lst  = jnp.clip(out[:, ACTION_DIM:], -3.0, -2.0)             # Fix 1
         std  = jnp.exp(lst)
         nlp  = -0.5 * jnp.sum(
             ((actions - mu) / std) ** 2 + 2 * lst + jnp.log(2 * jnp.pi), axis=-1)
@@ -576,18 +578,15 @@ def run_online_ppo(
                              jnp.clip(r, 1.0 - clip_eps, 1.0 + clip_eps) * adv_n)
         a_loss  = -jnp.mean(surr)
         entropy = jnp.mean(jnp.sum(lst + 0.5 * jnp.log(2 * jnp.pi * jnp.e), axis=-1))
-
-        # Critic ── MSE against GAE returns
         vals   = jax.vmap(lambda s: _ppo_mlp(cp_, s))(states).squeeze(-1)
         c_loss = jnp.mean((vals - rets) ** 2)
-
         return a_loss - entropy_coef * entropy + 0.5 * c_loss, (a_loss, c_loss, entropy)
 
     _ppo_grad = jax.jit(
         jax.value_and_grad(_ppo_loss, argnums=(0, 1), has_aux=True)
     )
 
-    # Warm-up: compile for the exact horizon size used in training
+    # Warm-up: compile for the exact (horizon, STATE_DIM=8) shape
     _z = lambda shape: jnp.zeros(shape)
     _ppo_grad(ap, cp,
               _z((horizon, STATE_DIM)), _z((horizon, ACTION_DIM)),
@@ -605,7 +604,7 @@ def run_online_ppo(
     # ── Initial evaluation ───────────────────────────────────────────────────
     x = jnp.array(x0, dtype=jnp.float64)
     _, Tx_now, Tz_now = _EVAL(x)
-    ema_rew = 0.0
+    Tz_prev, Tx_prev = float(Tz_now), float(Tx_now)   # Fix 3: delta reference
 
     param_hist, Tx_hist, Tz_hist = [], [], []
 
@@ -613,25 +612,29 @@ def run_online_ppo(
         d = jnp.array(drift_np)
 
         for _ in range(optimizer_freq):
-            state = make_state(x, float(Tz_now), float(Tx_now), ema_rew)
+            state = make_state(x, float(Tz_now), float(Tx_now), Tz_prev, Tx_prev)
 
             # Actor forward ──────────────────────────────────────────────────
             out    = _ppo_mlp(ap, state)
             mu     = action_scale * jnp.tanh(out[:ACTION_DIM])
-            lst    = jnp.clip(out[ACTION_DIM:], -4.0, -0.5)
-            std    = jnp.exp(lst)
+            lst    = jnp.clip(out[ACTION_DIM:], -3.0, -2.0)           # Fix 1
             rng, k = jax.random.split(rng)
             noise  = jax.random.normal(k, (ACTION_DIM,))
-            action = mu + std * noise
+            action = mu + jnp.exp(lst) * noise
             log_prob = float(-0.5 * jnp.sum(noise**2 + 2 * lst + jnp.log(2 * jnp.pi)))
 
             # Environment step ───────────────────────────────────────────────
             x_new = jnp.clip(x + action, BOUNDS_LO, BOUNDS_HI)
             x_act = jnp.clip(x_new + d,  BOUNDS_LO, BOUNDS_HI)
-            lv, Tx_now, Tz_now = _EVAL(x_act)
-            reward  = float(-lv)
-            ema_rew = 0.9 * ema_rew + 0.1 * reward
-            value   = float(_ppo_mlp(cp, state)[0])
+            _, Tx_now, Tz_now = _EVAL(x_act)
+
+            # Fix 2: cap ratio penalty so log(Tz) always matters
+            ratio_err = float(jnp.clip(
+                jnp.abs(Tz_now / jnp.clip(Tx_now, 1e-9, None) - nu), 0.0, 20.0))
+            reward = (float(jnp.log(jnp.clip(Tz_now, 1e-3, None)))
+                      + float(jnp.log(jnp.clip(Tx_now, 1e-9, None)))
+                      - lam * ratio_err)
+            value  = float(_ppo_mlp(cp, state)[0])
 
             # Buffer store ───────────────────────────────────────────────────
             buf_s[idx]  = np.array(state)
@@ -639,13 +642,14 @@ def run_online_ppo(
             buf_lp[idx] = log_prob
             buf_r[idx]  = reward
             buf_v[idx]  = value
+            Tz_prev, Tx_prev = float(Tz_now), float(Tx_now)  # Fix 3: update delta ref
             idx += 1
             x = x_new
 
             # PPO update when buffer full ─────────────────────────────────────
             if idx == horizon:
-                s_next     = make_state(x, float(Tz_now), float(Tx_now), ema_rew)
-                nv         = float(_ppo_mlp(cp, s_next)[0])
+                s_next = make_state(x, float(Tz_now), float(Tx_now), Tz_prev, Tx_prev)
+                nv     = float(_ppo_mlp(cp, s_next)[0])
                 advs, rets = _ppo_gae(buf_r, buf_v, nv, gamma, gae_lambda)
 
                 sj  = jnp.array(buf_s)
@@ -804,6 +808,7 @@ def main():
         horizon=args.ppo_horizon,
         n_ppo_epochs=args.ppo_epochs,
         batched_loss=batched,
+        nu=args.nu, lam=args.lam,
     )
     print(f"   T_z: mean={Tz_ppo.mean():.1f}, min={Tz_ppo.min():.1f} µs")
 
