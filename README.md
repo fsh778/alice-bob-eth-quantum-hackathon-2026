@@ -26,11 +26,17 @@ Because cat qubits are biased qubits, your optimizer must pursue two objectives 
 
 We defined the reward function to be $\log{T_z} + \log{T_x} - \lambda|T_z/T_x - bias_{const}|$. log bc. makes it easier for optimizer to solve.
 
-Then T_z and T_x are computed from the exponential fit to the $\langle\sigma_x\rangle and \langle\sigma_z\rangle$ decay. As a proxy for less computation, we do a linear fit to the beginning of the curve where the exponential function is $\approx 1-t/T_z$. The linear fit is performed with 5 datapoints in the T_z case and with 2 in the T_x case to account optimize the flatter curve fit for T_z as well as keeping the number of real experiments low. Therefore the loss function is can be considered efficient (it is for T_x and almost for T_z).
+Then T_z and T_x are computed from the exponential fit to the $\langle\sigma_x\rangle and \langle\sigma_z\rangle$ decay. As a proxy for less computation, we do a linear fit to the beginning of the curve where the exponential function is $\approx 1-t/T_z$. The linear fit is performed with 5 datapoints in the T_z case and with 2 in the T_x case to account optimize the flatter curve fit for T_z as well as keeping the number of real experiments low. Therefore the loss functions can be considered efficient (it is for T_x and almost for T_z).
 
-Furthermore, the reward function is made robust by not relying on the initial state to measure $\langle\sigma_x\rangle and \langle\sigma_z\rangle$ by not using the pauli matrices but using $\langle\sigma_x\rangle = (-1)^n$ as well as $\langle\sigma_z\rangle = X = 1/\sqrt{2}(a^{\dag}+a)$
+Furthermore, the reward function is made robust by not relying on the initial state to measure $\langle\sigma_x\rangle and \langle\sigma_z\rangle$ by not using the pauli matrices but using $\langle\sigma_x\rangle = (-1)^n$ as well as $\langle\sigma_z\rangle = X = 1/\sqrt{2}(a^{\dag}+a)$. 
+
+The reward function is then simply defined as $\log({T_X}) + \log({T_Z}) + \lambda * \abs{\eta - \frac{T_Z}{T_X}}$. For reinforcement learning as well as the CMA-ES optimzer we used a reward function while the gradient-based ADAM optimizer was used with a loss function. For the sake of adapting this to minimization algorithms we adjusted the sign and used minimization approaches on this new loss functions. 
 
 \TODO online optimizers
+
+We use several different approaches to otimize the parameters of our system. First we had to think through the physically consistent and meaningful parameters in our Hamiltonian. 
+To achieve a stable cat state in the storage resonator we needed to adjust the two-photon drive such that it overcomes the single-photon loss. From the adiabatic elimination relations this implied that we needed $\epsilon_d > 1.25$ MHz. This is dependent on the values for $g_2$ we allow in the end so we chose this as a lower bound. Our optimization results showed that making it even higher yields better results. 
+Furthermore the adiabatic elimination breaks down under certain parameter combinations that we also explored. The decay rate of the buffer needs to be greater than the two photon coupling such that we can later adiabatically eliminate the buffer resonator. 
 
 \TODO drift moodel
 
