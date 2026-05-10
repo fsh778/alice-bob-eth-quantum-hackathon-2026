@@ -88,31 +88,38 @@ BOUNDS_HI = jnp.array(BOUNDS[:, 1])
 def generate_drift_trajectory(
     n_steps: int, seed: int = 0, period: int = DRIFT_PERIOD
 ) -> np.ndarray:
-    """Pre-generate deterministic drift trajectory, shape (n_steps, 2) complex.
+    """Pre-generate deterministic drift trajectory, shape (n_steps, 4) real.
 
-    Column layout: [m_g₂(t), m_εd(t)] where each entry is a complex multiplier
-    applied directly to the nominal g₂ and εd control values:
-        g₂_phys(t)  = g₂_nom  · m_g₂(t)
-        εd_phys(t)  = εd_nom  · m_εd(t)
+    Column layout: [Re(m_g₂), Im(m_g₂), Re(m_εd), Im(m_εd)].
+    The complex multipliers are applied via apply_drift_np / apply_drift_jax:
+        g₂_phys = (x[0] + i·x[1]) · (col0 + i·col1)
+        εd_phys = (x[2] + i·x[3]) · (col2 + i·col3)
 
     Fixed seed ensures all optimizers see identical drift for fair comparison.
     """
-    traj = np.zeros((n_steps, 2), dtype=complex)
+    traj = np.zeros((n_steps, 4))
     for i in range(n_steps):
         A_t = np.sin(2.0 * np.pi * i / period) * np.exp(1j * i * 2 * np.pi / period)
-        traj[i, 0] = A_t
-        traj[i, 1] = A_t * 0.5 * np.exp(1j * DRIFT_PHASE)
+        B_t = A_t * 0.5 * np.exp(1j * DRIFT_PHASE)
+        traj[i, 0] = A_t.real   # Re(m_g₂)
+        traj[i, 1] = A_t.imag   # Im(m_g₂)
+        traj[i, 2] = B_t.real   # Re(m_εd)
+        traj[i, 3] = B_t.imag   # Im(m_εd)
     return traj
 
 
 def sinusoidal_only(n_steps: int, period: int = DRIFT_PERIOD) -> np.ndarray:
     """Pure sinusoidal drift (no OU) — overlay reference for drift plots.
-    Shape (n_steps, 2) complex, matching generate_drift_trajectory layout."""
+    Shape (n_steps, 4) real: [Re(m_g₂), Im(m_g₂), Re(m_εd), Im(m_εd)]."""
     t = np.arange(n_steps)
     phi = 2.0 * np.pi * t / period
-    traj = np.zeros((n_steps, 2), dtype=complex)
-    traj[:, 0] = np.sin(phi) * np.exp(1j * phi)
-    traj[:, 1] = np.sin(phi) * 0.5 * np.exp(1j * (phi + DRIFT_PHASE))
+    A = np.sin(phi) * np.exp(1j * phi)
+    B = A * 0.5 * np.exp(1j * DRIFT_PHASE)
+    traj = np.zeros((n_steps, 4))
+    traj[:, 0] = A.real
+    traj[:, 1] = A.imag
+    traj[:, 2] = B.real
+    traj[:, 3] = B.imag
     return traj
 
 
@@ -120,12 +127,14 @@ def apply_drift_np(x_nom: np.ndarray, drift: np.ndarray) -> np.ndarray:
     """Multiply g₂ and εd by their complex drift multipliers.
 
     x_nom: [Re(g₂), Im(g₂), Re(εd), Im(εd)]
-    drift: shape (2,) complex — [m_g₂, m_εd]
+    drift: shape (4,) real — [Re(m_g₂), Im(m_g₂), Re(m_εd), Im(m_εd)]
     Returns [Re(g₂_phys), Im(g₂_phys), Re(εd_phys), Im(εd_phys)].
     """
-    g2  = (x_nom[0] + 1j * x_nom[1]) * drift[0]
-    eps = (x_nom[2] + 1j * x_nom[3]) * drift[1]
-    return np.array([g2.real, g2.imag, eps.real, eps.imag])
+    g2r  = x_nom[0] * drift[0] - x_nom[1] * drift[1]
+    g2i  = x_nom[0] * drift[1] + x_nom[1] * drift[0]
+    epsr = x_nom[2] * drift[2] - x_nom[3] * drift[3]
+    epsi = x_nom[2] * drift[3] + x_nom[3] * drift[2]
+    return np.array([g2r, g2i, epsr, epsi])
 
 
 def apply_drift_jax(
@@ -324,8 +333,8 @@ def run_online_adam(
     param_hist = []
 
     for drift_np in drift_traj:
-        d_r = jnp.array(drift_np.real)
-        d_i = jnp.array(drift_np.imag)
+        d_r = jnp.array(drift_np[[0, 2]])
+        d_i = jnp.array(drift_np[[1, 3]])
         for _ in range(optimizer_freq):
             t_global += 1
             (_, _), g = grad_fn(x, d_r, d_i)
@@ -394,8 +403,8 @@ def run_online_adam_predictive(
     param_hist = []
 
     for drift_np in drift_traj:
-        d_r = jnp.array(drift_np.real)
-        d_i = jnp.array(drift_np.imag)
+        d_r = jnp.array(drift_np[[0, 2]])
+        d_i = jnp.array(drift_np[[1, 3]])
         last_m_hat = last_v_hat = None
 
         for _ in range(optimizer_freq):
@@ -707,8 +716,8 @@ def run_online_ppo(
     param_hist, Tx_hist, Tz_hist = [], [], []
 
     for drift_np in drift_traj:
-        d_r = jnp.array(drift_np.real)
-        d_i = jnp.array(drift_np.imag)
+        d_r = jnp.array(drift_np[[0, 2]])
+        d_i = jnp.array(drift_np[[1, 3]])
 
         for _ in range(optimizer_freq):
             state = make_state(x, float(Tz_now), float(Tx_now), Tz_prev, Tx_prev)
