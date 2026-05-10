@@ -10,21 +10,20 @@ Three phases, each producing separate saved plots:
   C  Continuous online re-optimization under the same drift — shows stabilization.
      → cat_online_stab.png
 
-Drift model applied to Re(g₂) and Re(ε_d):
+Drift model applied to g₂ and ε_d as multiplicative amplitude × phase perturbations:
   Sinusoidal: models slow environmental drift (temperature, flux bias, hours timescale).
-              g₂ amp 0.25 MHz (~13%), ε_d amp 0.60 MHz (~8%), 150-step period.
+              Δamp_g2=13%, Δφ_g2=0.08 rad; Δamp_eps=8%, Δφ_eps=0.05 rad, period=300 steps.
   Ornstein-Uhlenbeck: correlated stochastic noise from control electronics.
-              σ_g2=0.03 MHz, σ_eps=0.08 MHz, correlation length 30 steps.
-  Both components use a fixed RNG seed, so all four methods see identical drift
-  and comparisons are apples-to-apples.
+              σ_amp_g2=1.5%, σ_φ_g2=0.01 rad, σ_amp_eps=1%, σ_φ_eps=0.01 rad, τ=30 steps.
+  Both components use a fixed RNG seed, so all methods see identical drift.
 
 Online stabilization mechanism:
   CMA-ES: each step draws a population around the current mean, evaluates every
-          candidate at x_nominal + drift(t), tells the optimizer → mean tracks
-          the drift-shifted optimum without any explicit drift model.
-  Adam:   the gradient is computed at x_actual = x_nominal + drift(t).
-          Because ∂x_actual/∂x_nominal = I, this gradient = ∂L/∂x_nominal and
-          directly encodes how x_nominal must shift to compensate for drift.
+          candidate at apply_drift(x_nominal, drift(t)) → mean tracks the
+          drift-shifted optimum without any explicit drift model.
+  Adam:   the gradient is computed at x_actual = apply_drift(x_nominal, drift(t)).
+          Autodiff propagates through the rotation+scaling Jacobian ∂x_actual/∂x_nominal
+          and encodes exactly how x_nominal must shift to compensate for drift.
 
 Usage:
     python cat_online_stab.py
@@ -55,14 +54,18 @@ jax.config.update("jax_enable_x64", True)
 #  Scaled here to cat qubit parameters: g₂ ≈ 1.9 MHz, ε_d ≈ 7.5 MHz.
 #  Sinusoidal amplitudes represent typical flux / amplitude calibration errors
 #  in superconducting circuits.
-DRIFT_PERIOD = 300  # steps per sinusoidal cycle (slow drift → optimizer can keep up)
-DRIFT_AMP_G2 = 0.25  # sinusoidal amplitude for Re(g₂) [MHz]
-DRIFT_AMP_EPS = 0.60  # sinusoidal amplitude for Re(ε_d) [MHz]
-DRIFT_PHASE = np.pi / 3  # phase offset between g₂ and ε_d drifts
+DRIFT_PERIOD = 300       # steps per sinusoidal cycle (slow drift → optimizer can keep up)
+DRIFT_AMP_G2 = 0.13      # sinusoidal fractional amplitude drift for g₂ (~13%)
+DRIFT_PHASE_G2 = 0.08    # sinusoidal phase drift amplitude for g₂ [rad]
+DRIFT_AMP_EPS = 0.08     # sinusoidal fractional amplitude drift for ε_d (~8%)
+DRIFT_PHASE_EPS = 0.05   # sinusoidal phase drift amplitude for ε_d [rad]
+DRIFT_PHASE = np.pi / 3  # phase offset between g₂ and ε_d sinusoids
 
-OU_TAU = 30  # Ornstein-Uhlenbeck correlation length [steps]
-OU_STD_G2 = 0.030  # OU noise std for g₂ [MHz]
-OU_STD_EPS = 0.080  # OU noise std for ε_d [MHz]
+OU_TAU = 30              # Ornstein-Uhlenbeck correlation length [steps]
+OU_STD_AMP_G2 = 0.015   # OU noise std for g₂ fractional amplitude drift
+OU_STD_PHASE_G2 = 0.010  # OU noise std for g₂ phase drift [rad]
+OU_STD_AMP_EPS = 0.010   # OU noise std for ε_d fractional amplitude drift
+OU_STD_PHASE_EPS = 0.010 # OU noise std for ε_d phase drift [rad]
 
 # ── Parameter bounds (same as sweep) ─────────────────────────────────────────
 G2_MIN, G2_MAX = 1.2, 3.5
@@ -85,39 +88,58 @@ BOUNDS_HI = jnp.array(BOUNDS[:, 1])
 def generate_drift_trajectory(
     n_steps: int, seed: int = 0, period: int = DRIFT_PERIOD
 ) -> np.ndarray:
-    """
-    Pre-generate a deterministic drift trajectory of shape (n_steps, 4).
-    Layout: [Δg₂, 0, Δε_d, 0].
+    """Pre-generate deterministic drift trajectory, shape (n_steps, 2) complex.
 
-    Using a fixed seed and pre-generating ensures CMA-ES, Adam, static, and
-    online methods all experience identical drift — necessary for fair comparison.
-    The `period` argument overrides DRIFT_PERIOD for runtime tuning.
-    """
-    rng = np.random.default_rng(seed)
-    ou_g2 = ou_eps = 0.0
-    dt = 1.0 / OU_TAU
-    traj = np.zeros((n_steps, 4))
+    Column layout: [m_g₂(t), m_εd(t)] where each entry is a complex multiplier
+    applied directly to the nominal g₂ and εd control values:
+        g₂_phys(t)  = g₂_nom  · m_g₂(t)
+        εd_phys(t)  = εd_nom  · m_εd(t)
 
+    Fixed seed ensures all optimizers see identical drift for fair comparison.
+    """
+    traj = np.zeros((n_steps, 2), dtype=complex)
     for i in range(n_steps):
-        # Sinusoidal slow component (environmental)
-        slow_g2 = DRIFT_AMP_G2 * np.sin(2.0 * np.pi * i / period)
-        slow_eps = DRIFT_AMP_EPS * np.sin(2.0 * np.pi * i / period + DRIFT_PHASE)
-        # OU stochastic component (control electronics)
-        ou_g2 = ou_g2 * (1.0 - dt) + OU_STD_G2 * rng.standard_normal()
-        ou_eps = ou_eps * (1.0 - dt) + OU_STD_EPS * rng.standard_normal()
-        traj[i, 0] = slow_g2 + ou_g2
-        traj[i, 2] = slow_eps + ou_eps
-
+        A_t = np.sin(2.0 * np.pi * i / period) * np.exp(1j * i * 2 * np.pi / period)
+        traj[i, 0] = A_t
+        traj[i, 1] = A_t * 0.5 * np.exp(1j * DRIFT_PHASE)
     return traj
 
 
 def sinusoidal_only(n_steps: int, period: int = DRIFT_PERIOD) -> np.ndarray:
-    """Pure sinusoidal drift (no OU) — used for overlay in drift plot."""
+    """Pure sinusoidal drift (no OU) — overlay reference for drift plots.
+    Shape (n_steps, 2) complex, matching generate_drift_trajectory layout."""
     t = np.arange(n_steps)
-    traj = np.zeros((n_steps, 4))
-    traj[:, 0] = DRIFT_AMP_G2 * np.sin(2.0 * np.pi * t / period)
-    traj[:, 2] = DRIFT_AMP_EPS * np.sin(2.0 * np.pi * t / period + DRIFT_PHASE)
+    phi = 2.0 * np.pi * t / period
+    traj = np.zeros((n_steps, 2), dtype=complex)
+    traj[:, 0] = np.sin(phi) * np.exp(1j * phi)
+    traj[:, 1] = np.sin(phi) * 0.5 * np.exp(1j * (phi + DRIFT_PHASE))
     return traj
+
+
+def apply_drift_np(x_nom: np.ndarray, drift: np.ndarray) -> np.ndarray:
+    """Multiply g₂ and εd by their complex drift multipliers.
+
+    x_nom: [Re(g₂), Im(g₂), Re(εd), Im(εd)]
+    drift: shape (2,) complex — [m_g₂, m_εd]
+    Returns [Re(g₂_phys), Im(g₂_phys), Re(εd_phys), Im(εd_phys)].
+    """
+    g2  = (x_nom[0] + 1j * x_nom[1]) * drift[0]
+    eps = (x_nom[2] + 1j * x_nom[3]) * drift[1]
+    return np.array([g2.real, g2.imag, eps.real, eps.imag])
+
+
+def apply_drift_jax(
+    x_nom: jnp.ndarray, drift_r: jnp.ndarray, drift_i: jnp.ndarray
+) -> jnp.ndarray:
+    """JAX-differentiable drift application (real arithmetic, no complex dtype).
+
+    drift_r = Re(drift), drift_i = Im(drift), each shape (2,).
+    """
+    g2r  = x_nom[0] * drift_r[0] - x_nom[1] * drift_i[0]
+    g2i  = x_nom[0] * drift_i[0] + x_nom[1] * drift_r[0]
+    epsr = x_nom[2] * drift_r[1] - x_nom[3] * drift_i[1]
+    epsi = x_nom[2] * drift_i[1] + x_nom[3] * drift_r[1]
+    return jnp.array([g2r, g2i, epsr, epsi])
 
 
 # ── Phase A: static optimizers ────────────────────────────────────────────────
@@ -203,7 +225,10 @@ def evaluate_under_drift(
     the entire trajectory in one vmap call — efficient because the drift is
     already known.
     """
-    x_all = np.clip(x_fixed[None, :] + drift_traj, BOUNDS[:, 0], BOUNDS[:, 1])
+    x_all = np.clip(
+        np.array([apply_drift_np(x_fixed, d) for d in drift_traj]),
+        BOUNDS[:, 0], BOUNDS[:, 1],
+    )
     _, Txs, Tzs = batched_loss(jnp.array(x_all))
     return np.array(Txs), np.array(Tzs)
 
@@ -246,14 +271,20 @@ def run_online_cmaes(
     for drift_vec in drift_traj:
         for _ in range(optimizer_freq):
             xs_nom = np.array([opt.ask() for _ in range(batch_size)])
-            xs_act = np.clip(xs_nom + drift_vec[None, :], BOUNDS[:, 0], BOUNDS[:, 1])
+            xs_act = np.clip(
+                np.array([apply_drift_np(x, drift_vec) for x in xs_nom]),
+                BOUNDS[:, 0], BOUNDS[:, 1],
+            )
             losses, _, _ = batched_loss(jnp.array(xs_act))
             opt.tell([(xs_nom[i], float(losses[i])) for i in range(batch_size)])
         mean_hist.append(opt.mean.copy())
 
     # Batch-evaluate the nominal-mean trajectory at actual (drifted) operating points
     means = np.array(mean_hist)
-    x_eval = np.clip(means + drift_traj, BOUNDS[:, 0], BOUNDS[:, 1])
+    x_eval = np.clip(
+        np.array([apply_drift_np(m, d) for m, d in zip(means, drift_traj)]),
+        BOUNDS[:, 0], BOUNDS[:, 1],
+    )
     _, Txs, Tzs = batched_loss(jnp.array(x_eval))
     return np.array(Txs), np.array(Tzs), means
 
@@ -280,8 +311,8 @@ def run_online_adam(
     directly encodes the direction x_nominal must move to restore performance.
     """
 
-    def loss_with_drift(x_nom, d):
-        x_act = jnp.clip(x_nom + d, BOUNDS_LO, BOUNDS_HI)
+    def loss_with_drift(x_nom, d_r, d_i):
+        x_act = jnp.clip(apply_drift_jax(x_nom, d_r, d_i), BOUNDS_LO, BOUNDS_HI)
         loss, Tx, Tz = loss_fn(x_act)
         return loss, (Tx, Tz)
 
@@ -293,10 +324,11 @@ def run_online_adam(
     param_hist = []
 
     for drift_np in drift_traj:
-        d = jnp.array(drift_np)
+        d_r = jnp.array(drift_np.real)
+        d_i = jnp.array(drift_np.imag)
         for _ in range(optimizer_freq):
             t_global += 1
-            (_, _), g = grad_fn(x, d)
+            (_, _), g = grad_fn(x, d_r, d_i)
             m = 0.9 * m + 0.1 * g
             v = 0.999 * v + 0.001 * g**2
             m_hat = m / (1.0 - 0.9**t_global)
@@ -306,7 +338,10 @@ def run_online_adam(
         param_hist.append(np.array(x))
 
     params = np.array(param_hist)
-    x_eval = np.clip(params + drift_traj, BOUNDS[:, 0], BOUNDS[:, 1])
+    x_eval = np.clip(
+        np.array([apply_drift_np(p, d) for p, d in zip(params, drift_traj)]),
+        BOUNDS[:, 0], BOUNDS[:, 1],
+    )
     if batched_loss is not None:
         _, Txs, Tzs = batched_loss(jnp.array(x_eval))
     else:
@@ -346,8 +381,8 @@ def run_online_adam_predictive(
     [drift_level, drift_velocity] could implement this with ~10 lines of numpy.
     """
 
-    def loss_with_drift(x_nom, d):
-        x_act = jnp.clip(x_nom + d, BOUNDS_LO, BOUNDS_HI)
+    def loss_with_drift(x_nom, d_r, d_i):
+        x_act = jnp.clip(apply_drift_jax(x_nom, d_r, d_i), BOUNDS_LO, BOUNDS_HI)
         loss, Tx, Tz = loss_fn(x_act)
         return loss, (Tx, Tz)
 
@@ -359,12 +394,13 @@ def run_online_adam_predictive(
     param_hist = []
 
     for drift_np in drift_traj:
-        d = jnp.array(drift_np)
+        d_r = jnp.array(drift_np.real)
+        d_i = jnp.array(drift_np.imag)
         last_m_hat = last_v_hat = None
 
         for _ in range(optimizer_freq):
             t_global += 1
-            (_, _), g = grad_fn(x, d)
+            (_, _), g = grad_fn(x, d_r, d_i)
             m = 0.9 * m + 0.1 * g
             v = 0.999 * v + 0.001 * g**2
             last_m_hat = m / (1.0 - 0.9**t_global)
@@ -380,7 +416,10 @@ def run_online_adam_predictive(
         param_hist.append(np.array(x))
 
     params = np.array(param_hist)
-    x_eval = np.clip(params + drift_traj, BOUNDS[:, 0], BOUNDS[:, 1])
+    x_eval = np.clip(
+        np.array([apply_drift_np(p, d) for p, d in zip(params, drift_traj)]),
+        BOUNDS[:, 0], BOUNDS[:, 1],
+    )
     if batched_loss is not None:
         _, Txs, Tzs = batched_loss(jnp.array(x_eval))
     else:
@@ -432,7 +471,10 @@ def run_online_cmaes_predictive(
         mean_before = opt.mean.copy()
         for _ in range(optimizer_freq):
             xs_nom = np.array([opt.ask() for _ in range(batch_size)])
-            xs_act = np.clip(xs_nom + drift_vec[None, :], BOUNDS[:, 0], BOUNDS[:, 1])
+            xs_act = np.clip(
+                np.array([apply_drift_np(x, drift_vec) for x in xs_nom]),
+                BOUNDS[:, 0], BOUNDS[:, 1],
+            )
             losses, _, _ = batched_loss(jnp.array(xs_act))
             opt.tell([(xs_nom[i], float(losses[i])) for i in range(batch_size)])
 
@@ -442,7 +484,10 @@ def run_online_cmaes_predictive(
         mean_hist.append(mean_pred)
 
     means = np.array(mean_hist)
-    x_eval = np.clip(means + drift_traj, BOUNDS[:, 0], BOUNDS[:, 1])
+    x_eval = np.clip(
+        np.array([apply_drift_np(m, d) for m, d in zip(means, drift_traj)]),
+        BOUNDS[:, 0], BOUNDS[:, 1],
+    )
     _, Txs, Tzs = batched_loss(jnp.array(x_eval))
     return np.array(Txs), np.array(Tzs), means
 
@@ -662,7 +707,8 @@ def run_online_ppo(
     param_hist, Tx_hist, Tz_hist = [], [], []
 
     for drift_np in drift_traj:
-        d = jnp.array(drift_np)
+        d_r = jnp.array(drift_np.real)
+        d_i = jnp.array(drift_np.imag)
 
         for _ in range(optimizer_freq):
             state = make_state(x, float(Tz_now), float(Tx_now), Tz_prev, Tx_prev)
@@ -678,7 +724,7 @@ def run_online_ppo(
 
             # Environment step ───────────────────────────────────────────────
             x_new = jnp.clip(x + action, BOUNDS_LO, BOUNDS_HI)
-            x_act = jnp.clip(x_new + d, BOUNDS_LO, BOUNDS_HI)
+            x_act = jnp.clip(apply_drift_jax(x_new, d_r, d_i), BOUNDS_LO, BOUNDS_HI)
             _, Tx_now, Tz_now = _EVAL(x_act)
 
             # Fix 2: cap ratio penalty so log(Tz) always matters
