@@ -2,11 +2,14 @@
 """
 Multi-episode drift-aware PPO for cat-qubit stabilization.
 
-The PPO reward is exactly the negative of the Adam objective from
-`cat_lifetime_opt.make_loss_fn`:
+The static Adam warm start still comes from `cat_lifetime_opt.make_loss_fn`.
+For PPO itself, we use a stabilization objective that better matches the
+control requirement:
 
-    loss = -log(Tz) - log(Tx) + lam * abs(nu - Tz / Tx)
-    reward = -loss
+  - strongly prefer large Tz
+  - give only limited credit for increasing Tx
+  - penalize violating the ratio condition Tz / Tx >= nu
+  - do not penalize oversatisfying that ratio condition
 
 Key upgrades over the earlier single-episode script:
   - longer default training horizon per drift episode
@@ -147,7 +150,47 @@ def _sm(x, w=7):
     return x if w <= 1 else np.convolve(x, np.ones(w) / w, mode="same")
 
 
-def build_ppo_system(loss_fn, hidden_size, action_scale, horizon, seed):
+def control_loss_from_metrics(
+    Tx,
+    Tz,
+    nu,
+    tx_weight=0.20,
+    ratio_penalty=40.0,
+    max_log_tx_credit=1.5,
+):
+    """
+    PPO control loss.
+
+    Why this differs from the Adam objective:
+      The symmetric abs(nu - Tz/Tx) term treats "ratio too high" and
+      "ratio too low" as equally bad, while +log(Tx) can reward pathological
+      huge-Tx / low-Tz states. Here we only penalize ratio shortfall, because
+      the actual requirement is to satisfy Tz/Tx >= nu.
+    """
+    Tx = jnp.clip(Tx, 1e-9, 1e9)
+    Tz = jnp.clip(Tz, 1e-6, 1e9)
+    ratio = Tz / Tx
+    ratio_shortfall = jnp.maximum(nu - ratio, 0.0) / jnp.maximum(nu, 1.0)
+    tx_credit = jnp.minimum(jnp.log(Tx), max_log_tx_credit)
+    return -jnp.log(Tz) - tx_weight * tx_credit + ratio_penalty * ratio_shortfall**2
+
+
+def summarize_control_metrics(Tx, Tz, nu):
+    ratio = Tz / np.clip(Tx, 1e-9, None)
+    shortfall = np.maximum(nu - ratio, 0.0)
+    return ratio, shortfall
+
+
+def build_ppo_system(
+    loss_fn,
+    hidden_size,
+    action_scale,
+    horizon,
+    seed,
+    control_cfg,
+    log_std_min,
+    log_std_max,
+):
     eval_loss = jax.jit(loss_fn)
     state_dim = 4 * 6 + 3
     act_dim = 4
@@ -169,6 +212,7 @@ def build_ppo_system(loss_fn, hidden_size, action_scale, horizon, seed):
         drift_delta = drift - drift_prev
         residual = x_ref - x_eff
         ratio = Tz / jnp.clip(Tx, 1e-9, None)
+        shortfall = jnp.maximum(nu - ratio, 0.0) / max(float(nu), 1.0)
         return jnp.concatenate(
             [
                 (x_nom - BOUNDS_CENTER) / BOUNDS_SCALE,
@@ -181,7 +225,7 @@ def build_ppo_system(loss_fn, hidden_size, action_scale, horizon, seed):
                     [
                         (jnp.log(jnp.clip(Tz, 1e-6, 1e9)) - tz_mu) / tz_sc,
                         (jnp.log(jnp.clip(Tx, 1e-9, 1e9)) - tx_mu) / tx_sc,
-                        (ratio - nu) / max(float(nu), 1.0),
+                        shortfall,
                     ]
                 ),
             ]
@@ -200,7 +244,7 @@ def build_ppo_system(loss_fn, hidden_size, action_scale, horizon, seed):
     ):
         out = jax.vmap(lambda s: _mlp(actor_p, s))(states)
         mu = action_scale * jnp.tanh(out[:, :act_dim])
-        log_std = jnp.clip(out[:, act_dim:], -4.0, -1.5)
+        log_std = jnp.clip(out[:, act_dim:], log_std_min, log_std_max)
         std = jnp.exp(log_std)
         new_logp = -0.5 * jnp.sum(
             ((actions - mu) / std) ** 2 + 2 * log_std + jnp.log(2 * jnp.pi),
@@ -226,6 +270,14 @@ def build_ppo_system(loss_fn, hidden_size, action_scale, horizon, seed):
 
     return {
         "eval_loss": eval_loss,
+        "control_loss": lambda Tx, Tz, nu: control_loss_from_metrics(
+            Tx,
+            Tz,
+            nu,
+            tx_weight=control_cfg["tx_weight"],
+            ratio_penalty=control_cfg["ratio_penalty"],
+            max_log_tx_credit=control_cfg["max_log_tx_credit"],
+        ),
         "make_state": make_state,
         "ppo_grad": ppo_grad,
         "actor": actor,
@@ -239,6 +291,8 @@ def build_ppo_system(loss_fn, hidden_size, action_scale, horizon, seed):
         "act_dim": act_dim,
         "opt_step": 0,
         "action_scale": action_scale,
+        "log_std_min": log_std_min,
+        "log_std_max": log_std_max,
     }
 
 
@@ -302,7 +356,9 @@ def run_episode(
 
             actor_out = _mlp(ppo["actor"], state)
             mu = ppo["action_scale"] * jnp.tanh(actor_out[: ppo["act_dim"]])
-            log_std = jnp.clip(actor_out[ppo["act_dim"] :], -4.0, -1.5)
+            log_std = jnp.clip(
+                actor_out[ppo["act_dim"] :], ppo["log_std_min"], ppo["log_std_max"]
+            )
 
             if train:
                 ppo["rng"], sample_key = jax.random.split(ppo["rng"])
@@ -317,8 +373,9 @@ def run_episode(
 
             x_nom = jnp.clip(x_nom + action, BOUNDS_LO, BOUNDS_HI)
             x_eff = jnp.clip(x_nom + drift, BOUNDS_LO, BOUNDS_HI)
-            loss_val, Tx_eval, Tz_eval = ppo["eval_loss"](x_eff)
-            reward = -float(loss_val)
+            _, Tx_eval, Tz_eval = ppo["eval_loss"](x_eff)
+            control_loss = ppo["control_loss"](Tx_eval, Tz_eval, nu)
+            reward = -float(control_loss)
             Tx_now = float(Tx_eval)
             Tz_now = float(Tz_eval)
 
@@ -387,7 +444,7 @@ def run_episode(
         hist["x_nom"].append(np.array(x_nom))
         hist["x_eff"].append(np.array(x_eff))
         hist["drift"].append(np.array(drift))
-        hist["loss"].append(float(loss_val))
+        hist["loss"].append(float(control_loss))
         hist["reward"].append(reward)
         hist["Tx"].append(Tx_now)
         hist["Tz"].append(Tz_now)
@@ -395,7 +452,7 @@ def run_episode(
 
         if train and step % 100 == 0:
             print(
-                f"      step {step:4d}  reward={reward:8.3f}  loss={float(loss_val):8.3f}  "
+                f"      step {step:4d}  reward={reward:8.3f}  loss={float(control_loss):8.3f}  "
                 f"Tz={Tz_now:8.2f}  Tx={Tx_now:8.4f}"
             )
 
@@ -403,14 +460,14 @@ def run_episode(
 
 
 def summarize_episode(hist, nu):
-    ratio_err = np.abs(hist["ratio"] - nu)
+    ratio_shortfall = np.maximum(nu - hist["ratio"], 0.0)
     return {
         "reward_mean": float(np.mean(hist["reward"])),
         "reward_min": float(np.min(hist["reward"])),
         "Tz_mean": float(np.mean(hist["Tz"])),
         "Tz_min": float(np.min(hist["Tz"])),
         "Tx_mean": float(np.mean(hist["Tx"])),
-        "ratio_err_mean": float(np.mean(ratio_err)),
+        "ratio_shortfall_mean": float(np.mean(ratio_shortfall)),
     }
 
 
@@ -431,14 +488,19 @@ def main():
     parser.add_argument("--opt-freq", type=int, default=4)
     parser.add_argument("--horizon", type=int, default=128)
     parser.add_argument("--ppo-epochs", type=int, default=8)
-    parser.add_argument("--lr-actor", type=float, default=1e-3)
-    parser.add_argument("--lr-critic", type=float, default=3e-3)
+    parser.add_argument("--lr-actor", type=float, default=5e-4)
+    parser.add_argument("--lr-critic", type=float, default=1.5e-3)
     parser.add_argument("--clip-eps", type=float, default=0.2)
     parser.add_argument("--gamma", type=float, default=0.99)
     parser.add_argument("--gae-lambda", type=float, default=0.95)
-    parser.add_argument("--entropy-coef", type=float, default=0.01)
-    parser.add_argument("--action-scale", type=float, default=0.15)
+    parser.add_argument("--entropy-coef", type=float, default=0.003)
+    parser.add_argument("--action-scale", type=float, default=0.08)
     parser.add_argument("--hidden-size", type=int, default=96)
+    parser.add_argument("--tx-weight", type=float, default=0.20)
+    parser.add_argument("--ratio-penalty", type=float, default=40.0)
+    parser.add_argument("--max-log-tx-credit", type=float, default=1.5)
+    parser.add_argument("--log-std-min", type=float, default=-5.0)
+    parser.add_argument("--log-std-max", type=float, default=-3.0)
     parser.add_argument("--smooth", type=int, default=11)
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--no-plot", action="store_true")
@@ -472,12 +534,24 @@ def main():
     drift0 = generate_drift(args.n_steps, seed=args.drift_seed, period=args.drift_period)
     slow0 = sinusoidal_only(args.n_steps, period=args.drift_period)
     loss_static, Tx_static, Tz_static = evaluate_static(batched_loss, x_static, drift0)
-    reward_static = -loss_static
-    static_ratio = Tz_static / np.clip(Tx_static, 1e-9, None)
+    control_loss_static = np.array(
+        control_loss_from_metrics(
+            jnp.array(Tx_static),
+            jnp.array(Tz_static),
+            args.nu,
+            tx_weight=args.tx_weight,
+            ratio_penalty=args.ratio_penalty,
+            max_log_tx_credit=args.max_log_tx_credit,
+        )
+    )
+    reward_static = -control_loss_static
+    static_ratio, static_shortfall = summarize_control_metrics(
+        Tx_static, Tz_static, args.nu
+    )
     print(
         f"  reward mean={reward_static.mean():.3f}  "
         f"Tz mean={Tz_static.mean():.2f}  Tx mean={Tx_static.mean():.4f}  "
-        f"|ratio-nu| mean={np.mean(np.abs(static_ratio - args.nu)):.3f}"
+        f"ratio shortfall mean={np.mean(static_shortfall):.3f}"
     )
 
     ppo = build_ppo_system(
@@ -486,6 +560,13 @@ def main():
         action_scale=args.action_scale,
         horizon=args.horizon,
         seed=args.seed,
+        control_cfg={
+            "tx_weight": args.tx_weight,
+            "ratio_penalty": args.ratio_penalty,
+            "max_log_tx_credit": args.max_log_tx_credit,
+        },
+        log_std_min=args.log_std_min,
+        log_std_max=args.log_std_max,
     )
 
     train_metrics = {
@@ -493,14 +574,14 @@ def main():
         "reward_mean": [],
         "Tz_mean": [],
         "Tx_mean": [],
-        "ratio_err_mean": [],
+        "ratio_shortfall_mean": [],
     }
     eval_metrics = {
         "episode": [],
         "reward_mean": [],
         "Tz_mean": [],
         "Tx_mean": [],
-        "ratio_err_mean": [],
+        "ratio_shortfall_mean": [],
     }
     final_train_hist = None
     final_eval_hist = None
@@ -540,11 +621,13 @@ def main():
         train_metrics["reward_mean"].append(train_summary["reward_mean"])
         train_metrics["Tz_mean"].append(train_summary["Tz_mean"])
         train_metrics["Tx_mean"].append(train_summary["Tx_mean"])
-        train_metrics["ratio_err_mean"].append(train_summary["ratio_err_mean"])
+        train_metrics["ratio_shortfall_mean"].append(
+            train_summary["ratio_shortfall_mean"]
+        )
         print(
             f"    train  reward={train_summary['reward_mean']:.3f}  "
             f"Tz={train_summary['Tz_mean']:.2f}  Tx={train_summary['Tx_mean']:.4f}  "
-            f"|ratio-nu|={train_summary['ratio_err_mean']:.3f}"
+            f"ratio shortfall={train_summary['ratio_shortfall_mean']:.3f}"
         )
 
         if (ep + 1) % args.eval_every == 0 or ep == args.n_episodes - 1:
@@ -576,33 +659,35 @@ def main():
             eval_metrics["reward_mean"].append(eval_summary["reward_mean"])
             eval_metrics["Tz_mean"].append(eval_summary["Tz_mean"])
             eval_metrics["Tx_mean"].append(eval_summary["Tx_mean"])
-            eval_metrics["ratio_err_mean"].append(eval_summary["ratio_err_mean"])
+            eval_metrics["ratio_shortfall_mean"].append(
+                eval_summary["ratio_shortfall_mean"]
+            )
             print(
                 f"    eval   reward={eval_summary['reward_mean']:.3f}  "
                 f"Tz={eval_summary['Tz_mean']:.2f}  Tx={eval_summary['Tx_mean']:.4f}  "
-                f"|ratio-nu|={eval_summary['ratio_err_mean']:.3f}"
+                f"ratio shortfall={eval_summary['ratio_shortfall_mean']:.3f}"
             )
 
     print(
-        f"\n{'Method':<26} {'Reward mean':>12} {'Tz mean':>10} {'Tx mean':>10} {'|ratio-nu|':>12}"
+        f"\n{'Method':<26} {'Reward mean':>12} {'Tz mean':>10} {'Tx mean':>10} {'Shortfall':>12}"
     )
     print("─" * 78)
     print(
         f"{'Static (frozen baseline)':<26} {reward_static.mean():12.3f} "
         f"{Tz_static.mean():10.2f} {Tx_static.mean():10.4f} "
-        f"{np.mean(np.abs(static_ratio - args.nu)):12.3f}"
+        f"{np.mean(static_shortfall):12.3f}"
     )
     if train_metrics["episode"]:
         print(
             f"{'PPO train (last episode)':<26} {train_metrics['reward_mean'][-1]:12.3f} "
             f"{train_metrics['Tz_mean'][-1]:10.2f} {train_metrics['Tx_mean'][-1]:10.4f} "
-            f"{train_metrics['ratio_err_mean'][-1]:12.3f}"
+            f"{train_metrics['ratio_shortfall_mean'][-1]:12.3f}"
         )
     if eval_metrics["episode"]:
         print(
             f"{'PPO held-out eval (last)':<26} {eval_metrics['reward_mean'][-1]:12.3f} "
             f"{eval_metrics['Tz_mean'][-1]:10.2f} {eval_metrics['Tx_mean'][-1]:10.4f} "
-            f"{eval_metrics['ratio_err_mean'][-1]:12.3f}"
+            f"{eval_metrics['ratio_shortfall_mean'][-1]:12.3f}"
         )
 
     if args.no_plot:
@@ -619,7 +704,11 @@ def main():
     if len(ep_eval) > 0:
         axes[0, 0].plot(ep_eval, eval_metrics["reward_mean"], "o-", lw=1.3, label="held-out eval")
     axes[0, 0].axhline(reward_static.mean(), color="k", linestyle=":", lw=1.0, label="static baseline")
-    axes[0, 0].set(xlabel="Episode", ylabel="Mean reward", title="Reward = -loss")
+    axes[0, 0].set(
+        xlabel="Episode",
+        ylabel="Mean reward",
+        title="Reward = -stabilization loss",
+    )
     axes[0, 0].grid(True, alpha=0.3)
     axes[0, 0].legend(fontsize=8)
 
@@ -639,11 +728,29 @@ def main():
     axes[1, 0].grid(True, alpha=0.3)
     axes[1, 0].legend(fontsize=8)
 
-    axes[1, 1].plot(ep_train, train_metrics["ratio_err_mean"], lw=1.5, label="train")
+    axes[1, 1].plot(
+        ep_train, train_metrics["ratio_shortfall_mean"], lw=1.5, label="train"
+    )
     if len(ep_eval) > 0:
-        axes[1, 1].plot(ep_eval, eval_metrics["ratio_err_mean"], "o-", lw=1.3, label="held-out eval")
-    axes[1, 1].axhline(np.mean(np.abs(static_ratio - args.nu)), color="k", linestyle=":", lw=1.0, label="static baseline")
-    axes[1, 1].set(xlabel="Episode", ylabel="Mean |Tz/Tx - nu|", title="Ratio tracking")
+        axes[1, 1].plot(
+            ep_eval,
+            eval_metrics["ratio_shortfall_mean"],
+            "o-",
+            lw=1.3,
+            label="held-out eval",
+        )
+    axes[1, 1].axhline(
+        np.mean(static_shortfall),
+        color="k",
+        linestyle=":",
+        lw=1.0,
+        label="static baseline",
+    )
+    axes[1, 1].set(
+        xlabel="Episode",
+        ylabel="Mean max(nu - Tz/Tx, 0)",
+        title="Ratio condition violations",
+    )
     axes[1, 1].grid(True, alpha=0.3)
     axes[1, 1].legend(fontsize=8)
     fig1.tight_layout()
@@ -671,7 +778,16 @@ def main():
         loss_static_eval, Tx_static_eval, Tz_static_eval = evaluate_static(
             batched_loss, x_static, last_eval_drift
         )
-        reward_static_eval = -loss_static_eval
+        reward_static_eval = -np.array(
+            control_loss_from_metrics(
+                jnp.array(Tx_static_eval),
+                jnp.array(Tz_static_eval),
+                args.nu,
+                tx_weight=args.tx_weight,
+                ratio_penalty=args.ratio_penalty,
+                max_log_tx_credit=args.max_log_tx_credit,
+            )
+        )
 
         fig3, axes = plt.subplots(1, 3, figsize=(15, 4.5))
         fig3.suptitle("Held-out evaluation on unseen drift")
@@ -687,7 +803,11 @@ def main():
         axes[1].legend(fontsize=8)
         axes[2].plot(st, _sm(reward_static_eval, W), "k:", lw=1.0, label="static")
         axes[2].plot(st, _sm(final_eval_hist["reward"], W), lw=1.5, label="PPO")
-        axes[2].set(xlabel="Step", ylabel="Reward", title="Reward = -loss")
+        axes[2].set(
+            xlabel="Step",
+            ylabel="Reward",
+            title="Reward = -stabilization loss",
+        )
         axes[2].grid(True, alpha=0.3)
         axes[2].legend(fontsize=8)
         fig3.tight_layout()
