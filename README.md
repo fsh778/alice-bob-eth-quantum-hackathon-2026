@@ -14,13 +14,9 @@ Because cat qubits are biased qubits, your optimizer must pursue two objectives 
 
 /solution contains our simulation files
 
-\begin{list}
-  \item naive_implementation.ipynb:  cmaes optimizer (not online), no drift
-  \item naive_cmaes_drift.ipynb:  cmaes optimizer (not online), drift -> optimizer confused (naive_cmaes_drift_results)
-  -> this also implemented theoretically robust implementation of \sigma_z (\Hat{X} = 1/\sqrt{2}(a^{\dag}+a))and \sigma_x (parity) and 5 and 2 point linear fits as proxys for the exponential decay to fint T_z and T_x respectively.
-  \item 
-  
-\end{list}
+- naive_implementation.ipynb:  cmaes optimizer (not online), no drift
+- naive_cmaes_drift.ipynb:  cmaes optimizer (not online), drift -> optimizer confused (naive_cmaes_drift_results)
+  - this also implemented theoretically robust implementation of \sigma_z (\Hat{X} = 1/\sqrt{2}(a^{\dag}+a))and \sigma_x (parity) and 5 and 2 point linear fits as proxys for the exponential decay to fint T_z and T_x respectively.
 
 ## Methods
 
