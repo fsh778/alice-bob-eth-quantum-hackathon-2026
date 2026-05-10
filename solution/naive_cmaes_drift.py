@@ -121,19 +121,28 @@ def make_loss_fn():
         g_state = dq.coherent(NA, alpha_est)
         e_state = dq.coherent(NA, -alpha_est)
 
-        sz_op = dq.tensor(
-            g_state @ g_state.dag() - e_state @ e_state.dag(),
-            dq.eye(NB),
-        )
+        #sz_op = dq.tensor(
+        #    g_state @ g_state.dag() - e_state @ e_state.dag(),
+        #    dq.eye(NB),
+        #)
+
+        # Heterodyne replacement — alpha-free:
+        x_op = (a.dag() + a) / 2   # I quadrature, built once alongside a and b
 
         # ── T_Z proxy: 5-point early-time linear fit ─────────────────────────
         # ⟨σ_z(t)⟩ ≈ 1 − t/T_Z  →  slope of (⟨σ_z⟩ − 1) vs t = −1/T_Z
         psi_z = dq.tensor(g_state, dq.fock(NB, 0))
         res_z = dq.mesolve(
-            H, [loss_b, loss_a], psi_z, ts_z, exp_ops=[sz_op], options=_OPTS
+            #H, [loss_b, loss_a], psi_z, ts_z, exp_ops=[sz_op], options=_OPTS
+            H, [loss_b, loss_a], psi_z, ts_z, exp_ops=[x_op], options=_OPTS
+
         )
-        szt   = res_z.expects[0].real
-        slope = _linfit_slope(ts_z, szt - 1.0)
+        #szt   = res_z.expects[0].real
+        xt = res_z.expects[0].real
+        # Normalize by the first point to cancel α
+        xt_norm = xt / jnp.clip(xt[0], 1e-9, None)   # ≈ exp(−t/T_Z), starts at 1
+
+        slope = _linfit_slope(ts_z, xt_norm - 1.0)   # slope ≈ −1/T_Z
         Tz    = jnp.clip(-1.0 / jnp.clip(slope, -1.0, -1e-9), 1.0, 1e9)
 
         # ── T_X proxy: two-point parity ratio ────────────────────────────────
@@ -323,7 +332,7 @@ def main():
            title=f"Drift Signal  (±{DRIFT_AMP}, hidden from optimizer)")
     ax.legend(fontsize=8); ax.grid(True, alpha=0.3)
 
-    out_path = pathlib.Path(__file__).parent / "naive_cmaes_drift_results.png"
+    out_path = pathlib.Path(__file__).parent / "naive_cmaes_drift_results_without_aforT_z.png"
     plt.tight_layout()
     plt.savefig(out_path, dpi=150)
     print(f"\nSaved plots → {out_path}")
